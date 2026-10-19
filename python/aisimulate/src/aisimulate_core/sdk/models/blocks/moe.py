@@ -296,7 +296,12 @@ def _default_moe_block_ops(
     # ``cfg.system`` registry axis), so lightweight config doubles without the
     # attribute keep working; absent/uncovered phase means the fused path below.
     comm_backend = (getattr(cfg, "moe_comm_backend", None) or {}).get(inference_phase)
+    use_megamoe = getattr(cfg, "moe_backend", None) == "megamoe"
     if comm_backend:
+        if use_megamoe:
+            raise InvalidEngineConfigurationError(
+                "moe_backend='megamoe' cannot combine with a large-EP MoE comm backend"
+            )
         if getattr(cfg, "moe_kernel_source", None) is not None:
             raise InvalidEngineConfigurationError(
                 "moe_kernel_source is unsupported when moe_comm_backend selects the large-EP MoE graph"
@@ -366,6 +371,30 @@ def _default_moe_block_ops(
                 ),
             ]
         )
+
+    # MegaMoE: the measured SGLang/DeepGEMM routed module replaces the
+    # dispatch/compute/combine span; router and shared experts stay modeled above.
+    if use_megamoe:
+        if backend_name != "sglang":
+            raise InvalidEngineConfigurationError("moe_backend='megamoe' requires the SGLang backend")
+        if cfg.moe_tp_size != 1 or cfg.moe_ep_size <= 1:
+            raise InvalidEngineConfigurationError("moe_backend='megamoe' requires moe_tp_size=1 and moe_ep_size>1")
+        block_ops.append(
+            ops.DeepSeekV4MegaMoEModule(
+                f"{prefix}_megamoe",
+                scale_factor,
+                shape.hidden_size,
+                shape.moe_inter_size,
+                shape.topk,
+                shape.num_experts,
+                cfg.moe_tp_size,
+                cfg.moe_ep_size,
+                quant_mode,
+                workload_distribution,
+                is_context=is_context,
+            )
+        )
+        return block_ops
 
     # Fused/small-EP path: dispatch tokens to experts, moe calc and get tokens
     # back. Transcribed from MOEModel.__init__ (models/moe.py:195-237 context,

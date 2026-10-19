@@ -481,3 +481,113 @@ class TestPrefixPhaseConsistency:
                 backend_name="sglang",
                 inference_phase="generation",
             )
+
+
+class TestMegaMoeBackend:
+    """``moe_backend='megamoe'`` swaps the fused span for the measured MegaMoE module."""
+
+    QWEN3_FP8 = "Qwen/Qwen3-235B-A22B-FP8"
+
+    def _model(self, backend_name="sglang", **overrides):
+        cfg = dict(
+            tp_size=1,
+            attention_dp_size=8,
+            moe_tp_size=1,
+            moe_ep_size=8,
+            moe_backend="megamoe",
+            moe_quant_mode=common.MoEQuantMode.w4a8_mxfp4_mxfp8,
+            workload_distribution="uniform",
+        )
+        cfg.update(overrides)
+        return models.get_model(self.QWEN3_FP8, config.ModelConfig(**cfg), backend_name)
+
+    def test_qwen3_sglang_emits_megamoe_module_in_both_phases(self):
+        model = self._model()
+        shape = _shape_for(self.QWEN3_FP8)
+        for phase, op_list in (("context", model.context_ops), ("generation", model.generation_ops)):
+            names = [op._name for op in op_list]
+            assert f"{phase}_router_gemm" in names
+            assert f"{phase}_megamoe" in names
+            assert not any(name.endswith(("_moe_pre_dispatch", "_moe", "_moe_post_dispatch")) for name in names)
+            spec = next(op for op in op_list if op._name == f"{phase}_megamoe")._spec_json()
+            assert f'"hidden_size":{shape.hidden_size}' in spec
+            assert f'"inter_size":{shape.moe_inter_size}' in spec
+            assert f'"num_experts":{shape.num_experts}' in spec
+            assert '"workload_distribution":"balanced"' in spec
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"backend_name": "trtllm"}, "SGLang backend"),
+            ({"moe_tp_size": 2, "moe_ep_size": 4}, "moe_tp_size=1"),
+            ({"attention_dp_size": 1, "moe_ep_size": 1}, "moe_ep_size>1"),
+            (
+                {"moe_comm_backend": {"context": "deepep_ht", "generation": "deepep_ll"}, "num_gpus_per_node": 4},
+                "large-EP",
+            ),
+        ],
+    )
+    def test_rejects_unsupported_megamoe_configurations(self, overrides, message):
+        with pytest.raises(ValueError, match=message):
+            self._model(**overrides)
+
+    def test_query_reads_the_shape_keyed_megamoe_table(self, tmp_path):
+        """A Qwen3-shaped row in ``dsv4_megamoe_module_perf`` serves the generation op end to end."""
+        import importlib.resources
+        import shutil
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from aisimulate.sdk.perf_database import PerfDatabase
+
+        root = tmp_path / "systems"
+        root.mkdir()
+        systems_dir = importlib.resources.files("aisimulate_core") / "systems"
+        shutil.copy(systems_dir / "gb200.yaml", root / "gb200.yaml")
+        shape = _shape_for(self.QWEN3_FP8)
+        rows = [
+            {
+                "framework": "SGLang",
+                "version": "test",
+                "device": "NVIDIA GB200",
+                "op_name": "dsv4_megamoe_module",
+                "kernel_source": "deepgemm_megamoe",
+                "phase": "generation",
+                "moe_dtype": "w4a8_mxfp4_mxfp8",
+                "kernel_dtype": "fp8_fp4",
+                "num_tokens": tokens,
+                "global_num_tokens": tokens * 8,
+                "hidden_size": shape.hidden_size,
+                "inter_size": shape.moe_inter_size,
+                "topk": shape.topk,
+                "num_experts": shape.num_experts,
+                "num_fused_shared_experts": 0,
+                "moe_tp_size": 1,
+                "moe_ep_size": 8,
+                "distribution": "balanced",
+                "source_policy": "random",
+                "pre_dispatch": "sglang_jit",
+                "num_max_tokens_per_rank": tokens,
+                "effective_num_max_tokens_per_rank": tokens,
+                "routed_scaling_factor": 1.0,
+                "includes_routed_scale": True,
+                "includes_gate_topk": False,
+                "buffer_policy": "cached_sglang",
+                "includes_buffer_init": False,
+                "used_cuda_graph": True,
+                "latency": latency,
+            }
+            for tokens, latency in ((32, 0.100), (64, 0.120))
+        ]
+        table_path = root / "data/gb200/moe/sglang/0.5.10/dsv4_megamoe_module_perf.parquet"
+        table_path.parent.mkdir(parents=True)
+        pq.write_table(pa.table({k: [r[k] for r in rows] for k in rows[0]}), table_path)
+        db = PerfDatabase("gb200", "sglang", "0.5.10", str(root), database_mode="SILICON", strict_provenance=False)
+
+        model = self._model()
+        op = next(op for op in model.generation_ops if op._name == "generation_megamoe")
+
+        assert float(op._engine_query(db, x=32)) == pytest.approx(0.100 * op._scale_factor)
+        assert float(op._engine_query(db, x=64)) == pytest.approx(0.120 * op._scale_factor)
+        assert op._scale_factor == model._num_layers
