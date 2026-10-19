@@ -50,7 +50,10 @@ The perf row separates the AIC quant-mode label from the actual kernel path:
 MegaMoE kernel this means FP8 activation operands and FP4 weight operands.
 The collector also follows the DSv4 model configs: `norm_topk_prob=true`, with
 `routed_scaling_factor=1.5` for Flash and `2.5` for Pro unless explicitly
-overridden.
+overridden.  `MODEL_CONFIG=qwen3_235b` collects the Qwen3-235B-A22B routed
+shape (hidden 4096, intermediate 1536, 128 experts, top-k 8,
+`routed_scaling_factor=1.0`) with no activation clamp, matching its plain
+SiLU-gated experts; the rows land in the same shape-keyed table.
 
 The routed MegaMoE path uses the same SGLang/DeepGEMM kernel for context and
 generation.  The Kubernetes and Slurm runners can still be split with

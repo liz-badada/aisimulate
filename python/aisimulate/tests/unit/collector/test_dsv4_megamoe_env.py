@@ -22,10 +22,12 @@ sys.modules["torch"] = MagicMock()
 sys.modules["torch.distributed"] = MagicMock()
 try:
     from collector.sglang.collect_dsv4_megamoe import (
+        DEFAULT_MODEL_CONFIGS,
         CaseRunResult,
         MegaMoECase,
         aggregate_case_run_results,
         group_cases_for_logging,
+        resolve_activation_clamp,
     )
 finally:
     sys.modules.pop(_MODULE, None)
@@ -67,3 +69,30 @@ def test_aggregate_case_run_results_averages_latency_and_power():
     assert aggregated.row["latency"] == "2.000000"
     assert aggregated.row["distribution"] == "power_law_sampled_1.9"
     assert aggregated.power_stats["power"] == 200.0
+
+
+def test_qwen3_235b_config_matches_packaged_model_shape():
+    from aisimulate_core.sdk.models.blocks import MoEBlockShape
+    from aisimulate_core.sdk.models.helpers import _get_model_info
+
+    cfg = DEFAULT_MODEL_CONFIGS["qwen3_235b"]
+    shape = MoEBlockShape.from_model_info(_get_model_info(cfg["model"]))
+
+    assert (cfg["hidden_size"], cfg["inter_size"]) == (shape.hidden_size, shape.moe_inter_size)
+    assert (cfg["routed_num_experts"], cfg["routed_topk"]) == (shape.num_experts, shape.topk)
+    assert shape.num_shared_experts == 0
+    assert cfg["activation_clamp"] is None
+
+
+@pytest.mark.parametrize(
+    ("config_name", "requested", "expected"),
+    [("dsv4_pro", None, 10.0), ("dsv4_pro", 5.0, 5.0), ("qwen3_235b", None, None), ("kimi_k3", 0.03125, 0.03125)],
+)
+def test_resolve_activation_clamp_keeps_declared_contract(config_name, requested, expected):
+    assert resolve_activation_clamp(DEFAULT_MODEL_CONFIGS[config_name], requested, config_name=config_name) == expected
+
+
+@pytest.mark.parametrize(("config_name", "requested"), [("qwen3_235b", 10.0), ("kimi_k3", 10.0)])
+def test_resolve_activation_clamp_rejects_conflicting_override(config_name, requested):
+    with pytest.raises(ValueError, match="activation contract"):
+        resolve_activation_clamp(DEFAULT_MODEL_CONFIGS[config_name], requested, config_name=config_name)

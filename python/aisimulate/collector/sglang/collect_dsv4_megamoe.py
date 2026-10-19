@@ -90,6 +90,19 @@ DEFAULT_MODEL_CONFIGS = {
         "routed_scaling_factor": 1.0,
         "norm_topk_prob": True,
     },
+    # Qwen3-235B-A22B routed experts: plain SiLU-gated SwiGLU with no clamp
+    # (hidden_act=silu, no swiglu limit), so the mega kernel runs unclamped
+    # (activation_clamp=None, which DeepGEMM treats as +inf).
+    "qwen3_235b": {
+        "model": "Qwen/Qwen3-235B-A22B-FP8",
+        "activation_clamp": None,
+        "hidden_size": 4096,
+        "inter_size": 1536,
+        "routed_num_experts": 128,
+        "routed_topk": 8,
+        "routed_scaling_factor": 1.0,
+        "norm_topk_prob": True,
+    },
 }
 
 DEFAULT_GPUS_PER_NODE = {
@@ -672,6 +685,19 @@ def _default_gpus_per_node(system_name: str) -> int | None:
     return DEFAULT_GPUS_PER_NODE.get(system_name.upper())
 
 
+def resolve_activation_clamp(model_config: dict, requested: float | None, *, config_name: str) -> float | None:
+    """Return the clamp to run with; a declared config clamp (including None) cannot be overridden."""
+    config_clamp = model_config.get("activation_clamp", 10.0)
+    if requested is None:
+        return config_clamp
+    if requested != config_clamp and "activation_clamp" in model_config:
+        raise ValueError(
+            f"--activation-clamp {requested} conflicts with the {config_name!r} activation contract "
+            f"{config_clamp} — the mega kernel would silently run the wrong activation path under this label."
+        )
+    return requested
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect DSv4 DeepGEMM MegaMoE full-module latency.")
     parser.add_argument("--model-config", choices=sorted(DEFAULT_MODEL_CONFIGS), default="dsv4_pro")
@@ -723,15 +749,7 @@ def main() -> None:
     gpus_per_node = args.gpus_per_node or _default_gpus_per_node(args.system_name)
     dist_info = init_distributed(gpus_per_node)
     model_config = DEFAULT_MODEL_CONFIGS[args.model_config]
-    config_clamp = float(model_config.get("activation_clamp", 10.0))
-    if args.activation_clamp is None:
-        args.activation_clamp = config_clamp
-    elif args.activation_clamp != config_clamp and "activation_clamp" in model_config:
-        raise ValueError(
-            f"--activation-clamp {args.activation_clamp} conflicts with the "
-            f"{args.model_config!r} kernel-path sentinel {config_clamp} — the mega "
-            "kernel would silently run the wrong activation path under this label."
-        )
+    args.activation_clamp = resolve_activation_clamp(model_config, args.activation_clamp, config_name=args.model_config)
     ep_size = dist_info.world_size
     cases = build_cases(args, ep_size)
 
